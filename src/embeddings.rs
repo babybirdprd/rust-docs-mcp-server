@@ -1,28 +1,20 @@
-use crate::{
-    doc_loader::Document,
-    error::ServerError,
-    services::{EmbeddingGenerator, Reranker, RerankedDocument},
-};
-use anyhow::{anyhow, Result, Error as AnyhowError};
+use crate::{doc_loader::Document, error::ServerError};
 use async_openai::{
-    config::OpenAIConfig,
-    error::ApiError as OpenAIAPIErr,
-    types::{CreateEmbeddingRequestArgs, Embedding as OpenAIEmbedding}, // Added Embedding
+    config::OpenAIConfig, error::ApiError as OpenAIAPIErr, types::CreateEmbeddingRequestArgs,
     Client as OpenAIClient,
 };
-use async_trait::async_trait;
-use futures::stream::{self, StreamExt};
 use ndarray::{Array1, ArrayView1};
+use std::sync::OnceLock;
 use std::sync::Arc;
-use std::sync::OnceLock; // Keep OnceLock if OPENAI_CLIENT static is still used elsewhere.
 use tiktoken_rs::cl100k_base;
+use futures::stream::{self, StreamExt};
 
-// Static OnceLock for the OpenAI client - can be used for default client or removed if client is always passed.
-// For now, OpenAIEmbeddingClient will store its own client.
+// Static OnceLock for the OpenAI client
 pub static OPENAI_CLIENT: OnceLock<OpenAIClient<OpenAIConfig>> = OnceLock::new();
 
-use bincode::{Decode, Encode};
-use serde::{Deserialize, Serialize};
+
+use bincode::{Encode, Decode};
+use serde::{Serialize, Deserialize};
 
 // Define a struct containing path, content, and embedding for caching
 #[derive(Serialize, Deserialize, Debug, Encode, Decode)]
@@ -31,6 +23,7 @@ pub struct CachedDocumentEmbedding {
     pub content: String, // Add the extracted document content
     pub vector: Vec<f32>,
 }
+
 
 /// Calculates the cosine similarity between two vectors.
 pub fn cosine_similarity(v1: ArrayView1<f32>, v2: ArrayView1<f32>) -> f32 {
@@ -45,275 +38,108 @@ pub fn cosine_similarity(v1: ArrayView1<f32>, v2: ArrayView1<f32>) -> f32 {
     }
 }
 
-// --- OpenAI Embedding Client ---
-
-pub struct OpenAIEmbeddingClient {
-    client: OpenAIClient<OpenAIConfig>,
-    model: String, // Model name, e.g., "text-embedding-3-small"
-}
-
-impl OpenAIEmbeddingClient {
-    pub fn new(client: OpenAIClient<OpenAIConfig>, model: String) -> Self {
-        Self { client, model }
-    }
-
-    // Helper to make a single embedding request to OpenAI
-    async fn fetch_openai_embedding(&self, input: Vec<String>) -> Result<OpenAIEmbedding, AnyhowError> {
-        let request = CreateEmbeddingRequestArgs::default()
-            .model(&self.model)
-            .input(input.clone()) // Clone input here
-            .build()
-            .map_err(|e| anyhow!("Failed to build OpenAI request: {}", e))?;
-
-        let response = self.client.embeddings().create(request).await
-            .map_err(|e| anyhow!("OpenAI API call failed: {}", e))?;
-
-        response.data.into_iter().next()
-            .ok_or_else(|| anyhow!("OpenAI API returned no embedding data for input: {:?}", input))
-    }
-}
-
-#[async_trait]
-impl EmbeddingGenerator for OpenAIEmbeddingClient {
-    async fn generate_embeddings(
-        &self,
-        documents: Vec<String>,
-    ) -> Result<(Vec<Vec<f32>>, usize), AnyhowError> { // Updated return type
-        eprintln!(
-            "Generating embeddings for {} documents using OpenAI model {}...",
-            documents.len(),
-            self.model
-        );
-
-        let bpe = Arc::new(
-            cl100k_base().map_err(|e| anyhow!("Failed to load BPE tokenizer: {}", e))?,
-        );
-
-        const CONCURRENCY_LIMIT: usize = 8;
-        const TOKEN_LIMIT: usize = 8000; // OpenAI's limit for text-embedding-3-small is 8191
-
-        let results: Vec<Result<Option<Vec<f32>>, AnyhowError>> = stream::iter(documents)
-            .enumerate()
-            .map(|(index, doc_content)| {
-                let client = self.client.clone(); // Arc clone
-                let model_name = self.model.clone(); // Arc clone
-                let bpe_clone = Arc::clone(&bpe);
-
-                async move {
-                    let token_count = bpe_clone.encode_with_special_tokens(&doc_content).len();
-
-                    if token_count > TOKEN_LIMIT {
-                        eprintln!(
-                            "    Skipping document {}: Token count ({}) exceeds limit ({}).",
-                            index + 1,
-                            token_count,
-                            TOKEN_LIMIT
-                        );
-                        return Ok(None); // Skip this document
-                    }
-
-                    let request_args = CreateEmbeddingRequestArgs::default()
-                        .model(&model_name)
-                        .input(vec![doc_content.clone()]) // API expects Vec<String>
-                        .build()
-                        .map_err(|e| anyhow!("Failed to build OpenAI request for doc {}: {}", index + 1, e))?;
-                    
-                    match client.embeddings().create(request_args).await {
-                        Ok(response) => {
-                            let tokens = response.usage.total_tokens as usize;
-                            if let Some(embedding_data) = response.data.first() {
-                                Ok(Some((embedding_data.embedding.clone(), tokens))) // Return embedding and tokens
-                            } else {
-                                Err(anyhow!("OpenAI API returned no embedding for doc {}", index + 1))
-                            }
-                        }
-                        Err(e) => Err(anyhow!("OpenAI API call failed for doc {}: {}", index + 1, e)),
-                    }
-                }
-            })
-            .buffer_unordered(CONCURRENCY_LIMIT)
-            .collect()
-            .await;
-
-        let mut final_embeddings = Vec::new();
-        let mut total_processed_tokens = 0;
-        let mut successful_count = 0;
-
-        for res in results {
-            match res {
-                Ok(Some((embedding, tokens))) => {
-                    final_embeddings.push(embedding);
-                    total_processed_tokens += tokens;
-                    successful_count += 1;
-                }
-                Ok(None) => { /* Document was skipped */ }
-                Err(e) => {
-                    eprintln!("Error processing a document with OpenAI: {}", e);
-                    // Optionally: return Err(e) to fail the whole batch.
-                }
-            }
-        }
-        
-        eprintln!(
-            "Finished generating embeddings with OpenAI. Successfully processed {} out of {} documents. Total tokens: {}.",
-            successful_count,
-            documents.len(),
-            total_processed_tokens
-        );
-
-        if successful_count == 0 && !documents.is_empty() {
-            return Err(anyhow!("No documents were successfully embedded by OpenAI. Check logs for errors."));
-        }
-
-        Ok((final_embeddings, total_processed_tokens)) // Return embeddings and total tokens
-    }
-
-    async fn generate_single_embedding(
-        &self,
-        document: String,
-    ) -> Result<Vec<f32>, AnyhowError> {
-        eprintln!(
-            "Generating single embedding using OpenAI model {}...",
-            self.model
-        );
-        // This helper is also used by generate_embeddings, ensure it's compatible or adjust.
-        // For single embedding, token count is part of the main response.
-        eprintln!(
-            "Generating single embedding using OpenAI model {} for document (first 50 chars): {}...",
-            self.model, document.chars().take(50).collect::<String>()
-        );
-
-        let bpe = cl100k_base().map_err(|e| anyhow!("Failed to load BPE tokenizer for single embedding: {}", e))?;
-        let token_count_estimate = bpe.encode_with_special_tokens(&document).len();
-        const TOKEN_LIMIT: usize = 8000; 
-
-        if token_count_estimate > TOKEN_LIMIT {
-            return Err(anyhow!(
-                "Document token count ({}) for single embedding exceeds limit ({}).",
-                token_count_estimate, TOKEN_LIMIT
-            ));
-        }
-        
-        let request = CreateEmbeddingRequestArgs::default()
-            .model(&self.model)
-            .input(vec![document.clone()])
-            .build()
-            .map_err(|e| anyhow!("Failed to build OpenAI request for single embedding: {}", e))?;
-
-        let response = self.client.embeddings().create(request).await
-            .map_err(|e| anyhow!("OpenAI API call failed for single embedding: {}", e))?;
-
-        // We don't need to return token count for single embedding per trait, but good to log.
-        // eprintln!("Tokens used for single embedding: {}", response.usage.total_tokens);
-
-        response.data.into_iter().next()
-            .map(|data| data.embedding)
-            .ok_or_else(|| anyhow!("OpenAI API returned no embedding for single input document"))
-    }
-}
-
-// --- OpenAI Reranker ---
-
-pub struct OpenAIReranker; // Empty struct for now
-
-#[async_trait]
-impl Reranker for OpenAIReranker {
-    async fn rerank_documents(
-        &self,
-        _query: String, // Query is unused in this placeholder
-        documents: Vec<String>,
-    ) -> Result<Vec<RerankedDocument>, AnyhowError> {
-        eprintln!("OpenAIReranker: Returning documents in original order (placeholder).");
-        let reranked_docs = documents
-            .into_iter()
-            .enumerate()
-            .map(|(index, text)| RerankedDocument {
-                index,
-                text,
-                score: 1.0, // Dummy score
-            })
-            .collect();
-        Ok(reranked_docs)
-    }
-}
-
-
-// The original generate_embeddings function that worked with Vec<Document>
-// and returned (Vec<(String, Array1<f32>)>, usize) might be useful
-// to keep for the existing main.rs logic that expects paths and Array1<f32>.
-// Or, main.rs needs to be updated to use the new service traits.
-// For now, I'll keep it and mark it as potentially deprecated or for internal use.
-
-/// Generates embeddings for a list of `Document` structs using the OpenAI API.
-/// This version is kept for compatibility with existing logic in main.rs that
-/// expects (String path, Array1<f32> embedding) and token counts.
-/// It could be refactored to use OpenAIEmbeddingClient internally if desired.
-pub async fn generate_embeddings_with_paths_and_stats(
-    client: &OpenAIClient<OpenAIConfig>, // Accepts a client
+/// Generates embeddings for a list of documents using the OpenAI API.
+pub async fn generate_embeddings(
+    client: &OpenAIClient<OpenAIConfig>,
     documents: &[Document],
     model: &str,
-) -> Result<(Vec<(String, Array1<f32>)>, usize), ServerError> {
+) -> Result<(Vec<(String, Array1<f32>)>, usize), ServerError> { // Return tuple: (embeddings, total_tokens)
+    // eprintln!("Generating embeddings for {} documents...", documents.len());
+
+    // Get the tokenizer for the model and wrap in Arc
     let bpe = Arc::new(cl100k_base().map_err(|e| ServerError::Tiktoken(e.to_string()))?);
-    const CONCURRENCY_LIMIT: usize = 8;
-    const TOKEN_LIMIT: usize = 8000;
+
+    const CONCURRENCY_LIMIT: usize = 8; // Number of concurrent requests
+    const TOKEN_LIMIT: usize = 8000; // Keep a buffer below the 8192 limit
 
     let results = stream::iter(documents.iter().enumerate())
         .map(|(index, doc)| {
+            // Clone client, model, doc, and Arc<BPE> for the async block
             let client = client.clone();
-            let model_name = model.to_string(); // Use model_name to avoid conflict
-            let doc_clone = doc.clone(); // Use doc_clone
-            let bpe_clone = Arc::clone(&bpe);
+            let model = model.to_string();
+            let doc = doc.clone();
+            let bpe = Arc::clone(&bpe); // Clone the Arc pointer
 
             async move {
-                let token_count = bpe_clone.encode_with_special_tokens(&doc_clone.content).len();
+                // Calculate token count for this document
+                let token_count = bpe.encode_with_special_tokens(&doc.content).len();
+
                 if token_count > TOKEN_LIMIT {
-                    return Ok(None); // Skipped
+                    // eprintln!(
+                    //     "    Skipping document {}: Actual tokens ({}) exceed limit ({}). Path: {}",
+                    //     index + 1,
+                    //     token_count,
+                    //     TOKEN_LIMIT,
+                    //     doc.path
+                    // );
+                    // Return Ok(None) to indicate skipping, with 0 tokens processed for this doc
+                    return Ok::<Option<(String, Array1<f32>, usize)>, ServerError>(None); // Include token count type
                 }
+
+                // Prepare input for this single document
+                let inputs: Vec<String> = vec![doc.content.clone()];
 
                 let request = CreateEmbeddingRequestArgs::default()
-                    .model(&model_name)
-                    .input(vec![doc_clone.content.clone()])
-                    .build()
-                    .map_err(|e| ServerError::OpenAI(async_openai::error::OpenAIError::InvalidArgument(e.to_string())))?;
-                
-                match client.embeddings().create(request).await {
-                    Ok(response) => {
-                        if let Some(embedding_data) = response.data.first() {
-                            Ok(Some((
-                                doc_clone.path.clone(),
-                                Array1::from(embedding_data.embedding.clone()),
-                                token_count,
-                            )))
-                        } else {
-                            Err(ServerError::OpenAI(async_openai::error::OpenAIError::ApiError(OpenAIAPIErr {
-                                message: format!("No embedding data for doc {}", doc_clone.path),
-                                r#type: Some("sdk_error".to_string()), param: None, code: None,
-                            })))
-                        }
-                    }
-                    Err(e) => Err(ServerError::OpenAI(e)),
+                    .model(&model) // Use cloned model string
+                    .input(inputs)
+                    .build()?; // Propagates OpenAIError
+
+                // eprintln!(
+                //     "    Sending request for document {} ({} tokens)... Path: {}",
+                //     index + 1,
+                //     token_count, // Use correct variable name
+                //     doc.path
+                // );
+                let response = client.embeddings().create(request).await?; // Propagates OpenAIError
+                // eprintln!("    Received response for document {}.", index + 1);
+
+                if response.data.len() != 1 {
+                    return Err(ServerError::OpenAI(
+                        async_openai::error::OpenAIError::ApiError(OpenAIAPIErr {
+                            message: format!(
+                                "Mismatch in response length for document {}. Expected 1, got {}.",
+                                index + 1, response.data.len()
+                            ),
+                            r#type: Some("sdk_error".to_string()),
+                            param: None,
+                            code: None,
+                        }),
+                    ));
                 }
+
+                // Process result
+                let embedding_data = response.data.first().unwrap(); // Safe unwrap due to check above
+                let embedding_array = Array1::from(embedding_data.embedding.clone());
+                // Return Ok(Some(...)) for successful embedding, include token count
+                Ok(Some((doc.path.clone(), embedding_array, token_count))) // Include token count
             }
         })
-        .buffer_unordered(CONCURRENCY_LIMIT)
-        .collect::<Vec<Result<Option<(String, Array1<f32>, usize)>, ServerError>>>()
+        .buffer_unordered(CONCURRENCY_LIMIT) // Run up to CONCURRENCY_LIMIT futures concurrently
+        .collect::<Vec<Result<Option<(String, Array1<f32>, usize)>, ServerError>>>() // Update collected result type
         .await;
 
+    // Process collected results, filtering out errors and skipped documents, summing tokens
     let mut embeddings_vec = Vec::new();
-    let mut total_processed_tokens = 0;
+    let mut total_processed_tokens: usize = 0;
     for result in results {
         match result {
             Ok(Some((path, embedding, tokens))) => {
-                embeddings_vec.push((path, embedding));
-                total_processed_tokens += tokens;
+                embeddings_vec.push((path, embedding)); // Keep successful embeddings
+                total_processed_tokens += tokens; // Add tokens for successful ones
             }
-            Ok(None) => {} // Document was skipped
+            Ok(None) => {} // Ignore skipped documents
             Err(e) => {
-                eprintln!("Error during OpenAI embedding (with paths): {}", e);
-                // Potentially return error or continue
-                return Err(e); 
+                // Log error but potentially continue? Or return the first error?
+                // For now, let's return the first error encountered.
+                eprintln!("Error during concurrent embedding generation: {}", e);
+                return Err(e);
             }
         }
     }
-    Ok((embeddings_vec, total_processed_tokens))
+
+    eprintln!(
+        "Finished generating embeddings. Successfully processed {} documents ({} tokens).",
+        embeddings_vec.len(), total_processed_tokens
+    );
+    Ok((embeddings_vec, total_processed_tokens)) // Return tuple
 }

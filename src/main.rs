@@ -3,27 +3,16 @@ mod doc_loader;
 mod embeddings;
 mod error;
 mod server; // Keep server module as RustDocsServer is defined there
-mod services;
-mod voyage_client;
 
 // Use necessary items from modules and crates
 use crate::{
     doc_loader::Document,
-    embeddings::{
-        CachedDocumentEmbedding, OpenAIEmbeddingClient, OpenAIReranker, // Added OpenAIReranker
-        generate_embeddings_with_paths_and_stats, // Renamed from generate_embeddings
-        OPENAI_CLIENT,
-    },
+    embeddings::{generate_embeddings, CachedDocumentEmbedding, OPENAI_CLIENT},
     error::ServerError,
-    server::RustDocsServer,
-    services::{EmbeddingGenerator, Reranker}, // Added Reranker
-    voyage_client::VoyageAIClient,
+    server::RustDocsServer, // Import the updated RustDocsServer
 };
-use anyhow::Context; // For .context() error handling
-use async_openai::{config::OpenAIConfig, Client as OpenAIClient};
+use async_openai::{Client as OpenAIClient, config::OpenAIConfig};
 use bincode::config;
-use reqwest::Client as ReqwestClient; // For VoyageAI
-use std::sync::Arc; // For Arc-wrapping clients
 use cargo::core::PackageIdSpec;
 use clap::Parser; // Import clap Parser
 use ndarray::Array1;
@@ -78,17 +67,10 @@ async fn main() -> Result<(), ServerError> {
 
     // --- Parse CLI Arguments ---
     let cli = Cli::parse();
-    let specid_str = cli.package_spec.trim().to_string();
-    let features = cli
-        .features
-        .map(|f| f.into_iter().map(|s| s.trim().to_string()).collect());
-
-    // --- Determine Embedding Provider ---
-    let embedding_provider_name = env::var("EMBEDDING_PROVIDER")
-        .unwrap_or_else(|_| "openai".to_string())
-        .to_lowercase();
-    eprintln!("Using embedding provider: {}", embedding_provider_name);
-
+    let specid_str = cli.package_spec.trim().to_string(); // Trim whitespace
+    let features = cli.features.map(|f| {
+        f.into_iter().map(|s| s.trim().to_string()).collect() // Trim each feature
+    });
 
     // Parse the specid string
     let spec = PackageIdSpec::parse(&specid_str).map_err(|e| {
@@ -118,12 +100,11 @@ async fn main() -> Result<(), ServerError> {
     // Generate a stable hash for the features to use in the path
     let features_hash = hash_features(&features);
 
-    // Construct the relative path component including provider, features hash
-    let cache_filename = format!("embeddings_{}.bin", embedding_provider_name);
+    // Construct the relative path component including features hash
     let embeddings_relative_path = PathBuf::from(&crate_name)
         .join(&sanitized_version_req)
         .join(&features_hash) // Add features hash as a directory level
-        .join(cache_filename); // Use provider-specific filename
+        .join("embeddings.bin");
 
     #[cfg(not(target_os = "windows"))]
     let embeddings_file_path = {
@@ -197,122 +178,55 @@ async fn main() -> Result<(), ServerError> {
 
     // --- Generate or Use Loaded Embeddings ---
     let mut generated_tokens: Option<usize> = None;
-    let mut generation_cost: Option<f64> = None; // This might be provider-specific or removed
+    let mut generation_cost: Option<f64> = None;
     let mut documents_for_server: Vec<Document> = loaded_documents_from_cache.unwrap_or_default();
 
-    // --- Initialize OpenAI Client (used by OpenAI embedding service and potentially by server's LLM) ---
-    // This client is initialized regardless of the embedding provider,
-    // as the server might still use OpenAI for LLM tasks.
-    let openai_client_instance = if let Ok(api_base) = env::var("OPENAI_API_BASE") {
-        OpenAIClient::with_config(OpenAIConfig::new().with_api_base(api_base))
+    // --- Initialize OpenAI Client (needed for question embedding even if cache hit) ---
+    let openai_client = if let Ok(api_base) = env::var("OPENAI_API_BASE") {
+        let config = OpenAIConfig::new().with_api_base(api_base);
+        OpenAIClient::with_config(config)
     } else {
         OpenAIClient::new()
     };
     OPENAI_CLIENT
-        .set(openai_client_instance.clone())
-        .expect("Failed to set OpenAI client in OnceLock");
-
-
-    // --- Initialize Embedding Generator Service ---
-    let embedding_generator_service: Arc<dyn EmbeddingGenerator> = match embedding_provider_name.as_str() {
-        "openai" => {
-            let _openai_api_key = env::var("OPENAI_API_KEY").map_err(|_| {
-                ServerError::MissingEnvVar("OPENAI_API_KEY (for OpenAI provider)".to_string())
-            })?;
-            let model_name = env::var("EMBEDDING_MODEL")
-                .unwrap_or_else(|_| "text-embedding-3-small".to_string());
-            Arc::new(OpenAIEmbeddingClient::new(
-                openai_client_instance, // Use the client from OnceLock
-                model_name,
-            ))
-        }
-        "voyageai" => {
-            let api_key = env::var("VOYAGE_API_KEY").map_err(|_| {
-                ServerError::MissingEnvVar("VOYAGE_API_KEY (for VoyageAI provider)".to_string())
-            })?;
-            let model_name = env::var("VOYAGE_EMBEDDING_MODEL")
-                .unwrap_or_else(|_| "voyage-large-2-instruct".to_string());
-            // Create a new reqwest client for Voyage AI
-            let reqwest_client = ReqwestClient::new();
-            Arc::new(VoyageAIClient::new(
-                reqwest_client,
-                api_key,
-                model_name,
-                env::var("VOYAGE_RERANK_MODEL").unwrap_or_else(|_| "rerank-lite-1".to_string()), // Default rerank model
-            ))
-        }
-        _ => {
-            return Err(ServerError::Config(format!(
-                "Unsupported embedding provider: {}",
-                embedding_provider_name
-            )));
-        }
-    };
-    
-    // --- Initialize Reranker Service (Placeholder for now) ---
-    // This will eventually also depend on a provider choice. For now, default to OpenAIReranker.
-    let reranker_service: Arc<dyn Reranker> = Arc::new(OpenAIReranker);
-
+        .set(openai_client.clone()) // Clone the client for the OnceCell
+        .expect("Failed to set OpenAI client");
 
     let final_embeddings = match loaded_embeddings {
         Some(embeddings) => {
-            eprintln!("Using embeddings and documents loaded from cache for provider: {}.", embedding_provider_name);
+            eprintln!("Using embeddings and documents loaded from cache.");
             embeddings
         }
         None => {
-            eprintln!("Proceeding with documentation loading and embedding generation using provider: {}.", embedding_provider_name);
+            eprintln!("Proceeding with documentation loading and embedding generation.");
 
-            // Load documents if not already loaded (e.g. cache miss for embeddings but docs were loaded)
-            if documents_for_server.is_empty() {
-                 eprintln!(
-                    "Loading documents for crate: {} (Version Req: {}, Features: {:?})",
-                    crate_name, crate_version_req, features
-                );
-                documents_for_server =
-                    doc_loader::load_documents(&crate_name, &crate_version_req, features.as_ref())?;
-                eprintln!("Loaded {} documents.", documents_for_server.len());
-            }
+            let _openai_api_key = env::var("OPENAI_API_KEY")
+                .map_err(|_| ServerError::MissingEnvVar("OPENAI_API_KEY".to_string()))?;
 
+            eprintln!(
+                "Loading documents for crate: {} (Version Req: {}, Features: {:?})",
+                crate_name, crate_version_req, features
+            );
+            // Pass features to load_documents
+            let loaded_documents =
+                doc_loader::load_documents(&crate_name, &crate_version_req, features.as_ref())?; // Pass features here
+            eprintln!("Loaded {} documents.", loaded_documents.len());
+            documents_for_server = loaded_documents.clone();
 
-            let (generated_raw_embeddings, total_tokens) = {
-                let doc_contents: Vec<String> = documents_for_server
-                    .iter()
-                    .map(|d| d.content.clone())
-                    .collect();
-                
-                embedding_generator_service
-                    .generate_embeddings(doc_contents)
-                    .await
-                    .map_err(|e| ServerError::Other(format!("Embedding generation failed: {}", e)))?
-            };
-            
-            generated_tokens = Some(total_tokens); // Store total_tokens
+            eprintln!("Generating embeddings...");
+            let embedding_model: String = env::var("EMBEDDING_MODEL")
+                .unwrap_or_else(|_| "text-embedding-3-small".to_string());
+            let (generated_embeddings, total_tokens) =
+                generate_embeddings(&openai_client, &loaded_documents, &embedding_model).await?;
 
-            // Calculate cost if OpenAI (or adapt for other providers if they have similar token pricing)
-            if embedding_provider_name == "openai" {
-                let cost_per_million = 0.02; // Example for text-embedding-3-small
-                let estimated_cost = (total_tokens as f64 / 1_000_000.0) * cost_per_million;
-                eprintln!(
-                    "OpenAI embedding generation cost for {} tokens: ${:.6}",
-                    total_tokens, estimated_cost
-                );
-                generation_cost = Some(estimated_cost);
-            } else {
-                 eprintln!(
-                    "{} embedding generation processed {} tokens.",
-                    embedding_provider_name, total_tokens
-                );
-            }
-
-            // Combine raw embeddings with document paths
-            let mut combined_embeddings_with_paths = Vec::new();
-            for (i, raw_embedding) in generated_raw_embeddings.into_iter().enumerate() {
-                if let Some(doc) = documents_for_server.get(i) {
-                    combined_embeddings_with_paths.push((doc.path.clone(), Array1::from(raw_embedding)));
-                } else {
-                     eprintln!("Warning: Mismatch between document count and embedding count. Skipping embedding for index {}.", i);
-                }
-            }
+            let cost_per_million = 0.02;
+            let estimated_cost = (total_tokens as f64 / 1_000_000.0) * cost_per_million;
+            eprintln!(
+                "Embedding generation cost for {} tokens: ${:.6}",
+                total_tokens, estimated_cost
+            );
+            generated_tokens = Some(total_tokens);
+            generation_cost = Some(estimated_cost);
 
             eprintln!(
                 "Saving generated documents and embeddings to: {:?}",
@@ -321,9 +235,9 @@ async fn main() -> Result<(), ServerError> {
 
             let mut combined_cache_data: Vec<CachedDocumentEmbedding> = Vec::new();
             let embedding_map: std::collections::HashMap<String, Array1<f32>> =
-                combined_embeddings_with_paths.clone().into_iter().collect(); // Use the newly formed combined_embeddings_with_paths
+                generated_embeddings.clone().into_iter().collect();
 
-            for doc in &documents_for_server { // Iterate over documents_for_server
+            for doc in &loaded_documents {
                 if let Some(embedding_array) = embedding_map.get(&doc.path) {
                     combined_cache_data.push(CachedDocumentEmbedding {
                         path: doc.path.clone(),
@@ -337,38 +251,38 @@ async fn main() -> Result<(), ServerError> {
                     );
                 }
             }
-            
-            // Cache saving logic (remains largely the same, uses new path)
+
             match bincode::encode_to_vec(&combined_cache_data, config::standard()) {
                 Ok(encoded_bytes) => {
                     if let Some(parent_dir) = embeddings_file_path.parent() {
                         if !parent_dir.exists() {
-                            fs::create_dir_all(parent_dir).map_err(|e| {
-                                ServerError::Io(std::io::Error::new(
-                                    std::io::ErrorKind::Other,
-                                    format!("Failed to create cache directory {}: {}", parent_dir.display(), e),
-                                ))
-                            })?;
+                            if let Err(e) = fs::create_dir_all(parent_dir) {
+                                eprintln!(
+                                    "Warning: Failed to create cache directory {}: {}",
+                                    parent_dir.display(),
+                                    e
+                                );
+                            }
                         }
                     }
-                    fs::write(&embeddings_file_path, encoded_bytes).map_err(|e| {
-                        ServerError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Failed to write cache file: {}", e),
-                        ))
-                    })?;
-                    eprintln!("Cache saved successfully ({} items) for provider {}.", combined_cache_data.len(), embedding_provider_name);
+                    if let Err(e) = fs::write(&embeddings_file_path, encoded_bytes) {
+                        eprintln!("Warning: Failed to write cache file: {}", e);
+                    } else {
+                        eprintln!(
+                            "Cache saved successfully ({} items).",
+                            combined_cache_data.len()
+                        );
+                    }
                 }
                 Err(e) => {
                     eprintln!("Warning: Failed to encode data for cache: {}", e);
                 }
             }
-            combined_embeddings_with_paths // This is the `generated_embeddings`
+            generated_embeddings
         }
     };
 
     // --- Initialize and Start Server ---
-    // Note: RustDocsServer::new signature will need to change to accept Arc<dyn EmbeddingGenerator> and Arc<dyn Reranker>
     eprintln!(
         "Initializing server for crate: {} (Version Req: {}, Features: {:?})",
         crate_name, crate_version_req, features
@@ -400,15 +314,11 @@ async fn main() -> Result<(), ServerError> {
 
     // Create the service instance using the updated ::new()
     let service = RustDocsServer::new(
-        crate_name.clone(),
-        documents_for_server, // These are the full Document structs
-        final_embeddings,     // These are Vec<(String path, Array1<f32> embedding)>
+        crate_name.clone(), // Pass crate_name directly
+        documents_for_server,
+        final_embeddings,
         startup_message,
-        embedding_generator_service, // Pass the embedding generator
-        reranker_service,            // Pass the reranker
-    )
-    .map_err(|e| ServerError::Other(format!("Failed to create RustDocsServer: {}", e)))?;
-
+    )?;
 
     // --- Use standard stdio transport and ServiceExt ---
     eprintln!("Rust Docs MCP server starting via stdio...");
