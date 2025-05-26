@@ -59,39 +59,6 @@ the crate based on the documentation context.
   environment variable. (The server also requires network access to download
   crate dependencies and interact with the OpenAI API).
 
-## Environment Variables
-
-The server uses the following environment variables for configuration:
-
-### General Configuration
-
-*   `EMBEDDING_PROVIDER`: (Optional) Specifies the AI service provider for embeddings and potentially other features.
-    *   Set to `openai` to use OpenAI models (default).
-    *   Set to `voyageai` to use Voyage AI models.
-    *   If not set, defaults to `openai`.
-
-### OpenAI Configuration
-
-These variables are used when `EMBEDDING_PROVIDER` is set to `openai` or is not set.
-
-*   `OPENAI_API_KEY`: (Required if using OpenAI) Your OpenAI API key.
-*   `EMBEDDING_MODEL`: (Optional) The OpenAI model to use for generating embeddings.
-    *   Defaults to `text-embedding-3-small`.
-*   `LLM_MODEL`: (Optional) The OpenAI model to use for summarization and answering questions.
-    *   Defaults to `gpt-4o-mini-2024-07-18`.
-
-### Voyage AI Configuration
-
-These variables are used when `EMBEDDING_PROVIDER` is set to `voyageai`.
-
-*   `VOYAGE_API_KEY`: (Required if using Voyage AI) Your Voyage AI API key.
-*   `VOYAGE_EMBEDDING_MODEL`: (Optional) The Voyage AI model to use for generating embeddings.
-    *   Defaults to `voyage-large-2-instruct`.
-*   `VOYAGE_RERANK_MODEL`: (Optional) The Voyage AI model to use for reranking search results.
-    *   Defaults to `rerank-lite-1`.
-
-**Note:** Ensure that the API key for your chosen provider is correctly set. The server requires network access to interact with the selected AI provider's API.
-
 ## Installation
 
 The recommended way to install is to download the pre-compiled binary for your
